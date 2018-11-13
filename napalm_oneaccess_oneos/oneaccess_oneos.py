@@ -28,6 +28,11 @@ from napalm.base.exceptions import (
     CommandErrorException,
 )
 from napalm.base.netmiko_helpers import netmiko_args
+import re
+
+# Easier to store these as constants
+HOUR_SECONDS = 3600
+DAY_SECONDS = 24 * HOUR_SECONDS
 
 
 class OneAccessOneOSDriver(NetworkDriver):
@@ -147,4 +152,103 @@ class OneAccessOneOSDriver(NetworkDriver):
             configs['running'] = output
 
         return configs
+
+
+    @staticmethod
+    def parse_uptime(uptime_str):
+        """
+        Extract the uptime string from the given OneAccess.
+        Return the uptime in seconds as an integer
+        """
+        # Initialize to zero
+        (days, hours, minutes, seconds) = (0, 0, 0, 0)
+
+        m = re.match(".*(?P<days>[0-9]+)d (?P<hours>[0-9]+)h (?P<minutes>[0-9]+)m (?P<seconds>[0-9]+)s.*", uptime_str)
+        if m:
+            days = int(m.groupdict()["days"])
+            hours = int(m.groupdict()["hours"])
+            minutes = int(m.groupdict()["minutes"])
+            seconds = int(m.groupdict()["seconds"])
+
+        uptime_sec = (days * DAY_SECONDS) + (hours * HOUR_SECONDS) \
+                      + (minutes * 60) + seconds
+
+        return uptime_sec
+
+
+    def get_dns(self):
+        """Return local DNS or name-server settings"""
+
+        dns = {
+            "domain_name": None
+        }
+
+        show_ip_nameserver = self._send_command('show ip name-server')      
+
+        for l in show_ip_nameserver.splitlines():
+            if "Domain-name" in l:
+                dns["domain_name"] = l.split()[-1]
+                continue
+        return dns
+
+
+    def get_facts(self):
+        """Return a set of facts from the device."""
+
+        facts = {
+            "vendor": "OneAccess",
+            "uptime": None,
+            "os_version": None,
+            "boot_version": None,
+            "serial_number": None,
+            "device_id": None,
+            "model": None,
+            "hostname": None,
+            "fqdn": None
+        }        
+
+        # get output from device
+        show_system_status = self._send_command('show system status')
+        show_system_hardware = self._send_command('show system hardware')
+        show_hostname = self._send_command('hostname')
+        show_ip_int_brie = self._send_command('show ip int brief')
+        show_nameserver = self.get_dns()
+
+        for l in show_system_status.splitlines():
+            if "System Information" in l:
+                c = l.split()
+                facts["serial_number"] = c[-1]
+                facts["device_id"] = c[-3]
+                continue
+            if "Software version" in l:
+                facts["os_version"] = l.split()[-1]
+                continue
+            if "Boot version" in l:
+                facts["boot_version"] = l.split()[-1]
+                continue
+            if "Sys Up time" in l:
+                uptime_str = l.split(":")[-1]
+                facts["uptime"] = self.parse_uptime(uptime_str)
+                continue
+
+        for l in show_system_hardware.splitlines():
+            m = re.match(".*Device\s*:\s+(?P<MODEL>\S+).*", l)
+            if m:
+                facts["model"] = m.groupdict()["MODEL"]
+                break
+
+        for l in show_hostname.splitlines():
+            if l:
+                facts["hostname"] = l.strip()
+                break
+
+        facts["fqdn"] = "{}.{}".format(facts["hostname"], show_nameserver["domain_name"])
+
+        return facts
+
+
+if __name__ == '__main__':
+    import json
+    o = OneAccessOneOSDriver("host", "user", "pass")
+    print(json.dumps(o.get_facts()))
 
