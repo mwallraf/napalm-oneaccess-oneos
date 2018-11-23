@@ -128,7 +128,7 @@ class OneAccessOneOSDriver(NetworkDriver):
         """
         Saves the config of the WLC, uses the paramiko save_config() function
         """
-        output = self.device.save_config()        
+        output = self.device.save_config()
         return output
 
 
@@ -183,7 +183,7 @@ class OneAccessOneOSDriver(NetworkDriver):
             "domain_name": None
         }
 
-        show_ip_nameserver = self._send_command('show ip name-server')      
+        show_ip_nameserver = self._send_command('show ip name-server')
 
         for l in show_ip_nameserver.splitlines():
             if "Domain-name" in l:
@@ -192,8 +192,43 @@ class OneAccessOneOSDriver(NetworkDriver):
         return dns
 
 
+    def get_tacacs_server(self):
+        """Return output for 'get tacacs-server'"""
+
+        tacacs_server = {
+            "servers": []
+        }
+
+        rexSrv = re.compile('^\s*(?P<IP>\S+)\s+(?P<PORT>\S+)\s+(?P<KEY>\S+)(?:\s+(?P<INT>\S+ [0-9]\S*))?(?:\s+(?P<VRF>\S+))?$')
+        # get output
+        show_tacacs_server = self._send_command("show tacacs-server")
+
+        start_parsing = False
+        for l in show_tacacs_server.splitlines():
+            l = l.strip()
+            if 'Port' in l:
+                start_parsing = True
+                continue
+            if not start_parsing:
+                continue
+            m = rexSrv.match(l)
+            if m:
+                tacacs_server["servers"].append({
+                    "server": m.groupdict()["IP"],
+                    "port": m.groupdict()["PORT"],
+                    "key": m.groupdict()["KEY"],
+                    "is_encrypted": True,
+                    "source_interface": m.groupdict().get("INT", None) or None,
+                    "vrf": m.groupdict().get("VRF", None) or None
+                })
+
+        return tacacs_server
+
     def get_facts(self):
-        """Return a set of facts from the device."""
+        """Return a set of facts from the device.
+           The management interface can only be found if Tacacs is configured
+             with a source interface
+        """
 
         facts = {
             "vendor": "OneAccess",
@@ -204,8 +239,9 @@ class OneAccessOneOSDriver(NetworkDriver):
             "device_id": None,
             "model": None,
             "hostname": None,
-            "fqdn": None
-        }        
+            "fqdn": None,
+            "mgmt_interface": None
+        }
 
         # get output from device
         show_system_status = self._send_command('show system status')
@@ -213,6 +249,9 @@ class OneAccessOneOSDriver(NetworkDriver):
         show_hostname = self._send_command('hostname')
         show_ip_int_brie = self._send_command('show ip int brief')
         show_nameserver = self.get_dns()
+        tacacs = self.get_tacacs_server()
+        if len(tacacs["servers"]) > 0:
+            facts["mgmt_interface"] = tacacs["servers"][0]["source_interface"]
 
         for l in show_system_status.splitlines():
             if "System Information" in l:
@@ -247,8 +286,117 @@ class OneAccessOneOSDriver(NetworkDriver):
         return facts
 
 
+    def get_netflow(self):
+        """
+        Get Netflow facts:
+
+        netwflow: {
+            "cache_timeout_active": xx,
+            "cahce_timeout_inactive": xx,
+            "exporters": [
+            ],
+            monitors: [
+            ],
+            interfaces: [
+            ]
+        }
+
+        """
+        netflow = {
+            "cache_timeout_active": None,
+            "cache_timeout_inactive": None,
+            "exporters": [],
+            "monitors": [],
+            "interfaces": []
+        }
+
+        cmd_stats = "show flow cache statistics"
+        cmd_exporters = "show flow exporter"
+        cmd_monitors = "show flow monitor"
+        cmd_interfaces = "show flow interface"
+
+        # get output from device
+        show_stats = self._send_command(cmd_stats)
+        show_exporters = self._send_command(cmd_exporters)
+        show_monitors = self._send_command(cmd_monitors)
+        show_interfaces = self._send_command(cmd_interfaces)
+
+        for l in show_stats.splitlines():
+            if 'Inactive' in l:
+                netflow["cache_timeout_inactive"] = l.split()[-2]
+                continue
+            if 'Active timer' in l:
+                netflow["cache_timeout_active"] = l.split()[2]
+                continue
+
+        exporter = None
+        for l in show_exporters.splitlines():
+            if l.startswith("Flow exporter"):
+                if exporter:
+                    netflow["exporters"].append(exporter)
+                exporter = { 
+                    "exporter": l.split()[-1].replace(":", ""),
+                    "dest": None,
+                    "dest_port": None,
+                    "src": None
+                }
+                continue
+            if exporter and "destination address" in l:
+                c = l.split()[-1].split(":")
+                exporter["dest"] = c[0]
+                if len(c) > 1:
+                    exporter["dest_port"] = c[1]
+                continue
+            if exporter and "source address" in l:
+                exporter["src"] = l.split()[-1]
+                continue
+        if exporter:
+            netflow["exporters"].append(exporter)
+
+        monitor = None
+        for l in show_monitors.splitlines():
+            if l.startswith("Flow monitor"):
+                if monitor:
+                    netflow["monitors"].append(monitor)
+                monitor = {
+                    "monitor": l.split()[-1].replace(":", ""),
+                    "exporter": None
+                }
+                continue
+            if monitor and " exporter " in l:
+                monitor["exporter"] = l.split()[-1]
+                continue
+        if monitor:
+            netflow["monitors"].append(monitor)
+
+        intf = None
+        for l in show_interfaces.splitlines():
+            if l and not l.startswith(" ") and l.endswith(":"):
+                if intf:
+                    netflow["interfaces"].append(intf)
+                intf = {
+                    "interface": l.replace(":", ""),
+                    "monitor-in": None,
+                    "monitor-out": None
+                }
+                continue
+            if intf and "flow monitor input" in l:
+                intf["monitor-in"] = l.split()[-1]
+                continue
+            if intf and "flow monitor output" in l:
+                intf["monitor-out"] = l.split()[-1]
+                continue
+        if intf:
+            netflow["interfaces"].append(intf)
+
+        return netflow
+
+
+
+
+
 if __name__ == '__main__':
     import json
     o = OneAccessOneOSDriver("host", "user", "pass")
-    print(json.dumps(o.get_facts()))
+    print(json.dumps(o.get_netflow()))
 
