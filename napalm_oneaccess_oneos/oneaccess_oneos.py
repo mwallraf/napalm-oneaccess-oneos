@@ -50,13 +50,26 @@ class OneAccessOneOSDriver(NetworkDriver):
             optional_args = {}
 
         self.netmiko_optional_args = netmiko_args(optional_args)
-        self.netmiko_optional_args.setdefault('port', 22)
+
+        self.transport = optional_args.get("transport", "ssh")
+
+        # Set the default port if not set
+        default_port = {"ssh": 22, "telnet": 23}
+        self.netmiko_optional_args.setdefault("port", default_port[self.transport])
+
+        if self.transport == "telnet":
+            # Telnet only supports inline_transfer
+            self.inline_transfer = True
 
         self.profile = [ "oneaccess_oneos_ssh" ]
 
     def open(self):
         """Implement the NAPALM method open (mandatory)"""
         device_type = 'oneaccess_oneos'
+
+        if self.transport == "telnet":
+            device_type = 'oneaccess_oneos_telnet'
+
         self.device = self._netmiko_open(device_type, netmiko_optional_args=self.netmiko_optional_args)
 
 
